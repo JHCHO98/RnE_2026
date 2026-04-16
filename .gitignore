@@ -1,0 +1,6 @@
+.venv/
+*.bin
+*.png
+*.pt
+*.txt
+*.csv
