@@ -51,15 +51,15 @@ def csv_to_list_of_dicts(file_path):
         return None
 
 TRIAL=int(input('몇 번째 모델이신가요??: '))
-MODEL_SAVE_PATH = f'emergency/asdf{TRIAL}.pt'
-LOG_PATH = f'emergency/log_{TRIAL}.txt'
-ACC_PLOT_PATH=f'emergency/asdf_acc_{TRIAL}.png'
-LOSS_PLOT_PATH=f'emergency/asdf_loss_{TRIAL}.png'
+MODEL_SAVE_PATH = f'emergency/model/asdf{TRIAL}.pt'
+LOG_PATH = f'emergency/log/log_{TRIAL}.txt'
+ACC_PLOT_PATH=f'emergency/plot/asdf_acc_{TRIAL}.png'
+LOSS_PLOT_PATH=f'emergency/plot/asdf_loss_{TRIAL}.png'
 sys.stdout = Logger(LOG_PATH)
 data_list = csv_to_list_of_dicts("data/data_pls.csv")
 title_weight=10.0
 comment_weight=1.00
-dropout=0.3
+dropout=0.4
 base_dropout=0.3
 
 # ==========================================
@@ -107,74 +107,96 @@ def collate_fn(batch):
 # ==========================================
 # 3. 모델 아키텍처 (SBERT + Self-Attention)
 # ==========================================
+
 class BiasAnalyzer(nn.Module):
     def __init__(self, config):
         super(BiasAnalyzer, self).__init__()
         self.device = config['device']
         
-        # A. Backbone: KcELECTRA
-        print(f"Loading KcBERT model: {config['model_name']}...")
-        config_ = AutoConfig.from_pretrained(config['model_name'])
-        config_.hidden_dropout_prob = base_dropout  # 원하는 비율로 설정
-        config_.attention_probs_dropout_prob = base_dropout
-        self.bert = AutoModel.from_pretrained(config['model_name'], config=config_)
-
+        # 1. Backbone
+        self.bert = AutoModel.from_pretrained(config['model_name'])
         self.tokenizer = AutoTokenizer.from_pretrained(config['model_name'])
+        self.hidden_dim = self.bert.config.hidden_size # 768
         
-        # B. Task Head
+        # 2. Cross-Attention Layers
+        self.title_to_comment_attn = nn.MultiheadAttention(
+            embed_dim=self.hidden_dim, num_heads=8, batch_first=True
+        )
+        self.comment_to_title_attn = nn.MultiheadAttention(
+            embed_dim=self.hidden_dim, num_heads=8, batch_first=True
+        )
+        
+        # 3. Final Classification Head
+        # [Self-T, Self-C, Cross-T2C, Cross-C2T] 4개를 붙이므로 * 4
+        combined_dim = self.hidden_dim * 4
+        intermediate_dim = config.get('intermediate_dim', 512) # 3072를 먼저 1024로 압축
+
         self.classifier = nn.Sequential(
-            nn.Linear(config['hidden_dim'], config['hidden_dim'] // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(config['hidden_dim'] // 2, config['num_classes'])
+            # Layer 1: 거대한 입력을 중간 크기로 압축
+            nn.Dropout(0.5),
+            nn.Linear(combined_dim, intermediate_dim),
+            nn.BatchNorm1d(intermediate_dim),
+            nn.LeakyReLU(0.1), # ReLU보다 조금 더 유연한 LeakyReLU 추천
+            
+            # Layer 2: 특징들을 다시 한번 정제
+            nn.Dropout(0.4),
+            nn.Linear(intermediate_dim, intermediate_dim // 2),
+            nn.BatchNorm1d(intermediate_dim // 2),
+            nn.LeakyReLU(0.1),
+            
+            # Layer 3: 최종 출력
+            nn.Dropout(0.2),
+            nn.Linear(intermediate_dim // 2, config['num_classes'])
         )
 
         self.to(self.device)
 
     def forward(self, batch_texts):
-        """
-        batch_texts: [ ["제목1", "댓글1"], ["제목2", "댓글2"] ]
-        """
         titles = [item[0] for item in batch_texts]
         comments = [item[1] for item in batch_texts]
 
-        # 1. Tokenizing (제목과 댓글을 하나의 Pair로 입력)
-        # padding/truncation을 통해 [CLS] Title [SEP] Comment [SEP] 구조 생성
-        # token_type_ids가 자동으로 생성됨 (Title=0, Comment=1)
-        inputs = self.tokenizer(
-            titles, 
-            comments, 
-            return_tensors='pt', 
-            padding=True, 
-            truncation=True, 
-            max_length=512
-        ).to(self.device)
-        
-        # 2. Forward pass
-        outputs = self.bert(**inputs)
-        last_hidden_state = outputs.last_hidden_state # (Batch, Seq_Len, Hidden)
-        
-        # 3. Weighted Pooling (제목 부분에 더 집중)
-        # token_type_ids가 0인 부분(제목)과 1인 부분(댓글)을 구분
-        token_type_ids = inputs['token_type_ids']
-        attention_mask = inputs['attention_mask']
+        # A. 인코딩
+        t_inputs = self.tokenizer(titles, return_tensors='pt', padding=True, truncation=True, max_length=256).to(self.device)
+        c_inputs = self.tokenizer(comments, return_tensors='pt', padding=True, truncation=True, max_length=256).to(self.device)
 
-        # 제목(0) 부분에 가중치 2.0, 댓글(1) 부분에 가중치 1.0 부여 (수치 조절 가능)
-        # [PAD] 토큰 제외를 위해 attention_mask 결합
-        weight_mask = torch.where(token_type_ids == 0, title_weight, comment_weight) * attention_mask
-        
-        # 가중 평균 풀링 (Weighted Mean Pooling)
-        weight_mask_expanded = weight_mask.unsqueeze(-1).expand(last_hidden_state.size()).float()
-        sum_embeddings = torch.sum(last_hidden_state * weight_mask_expanded, 1)
-        sum_mask = torch.clamp(weight_mask_expanded.sum(1), min=1e-9)
-        
-        video_vector = sum_embeddings / sum_mask # 최종 문장 벡터 (Batch, Hidden)
-        
-        # 4. Classification
-        logits = self.classifier(video_vector)
-        
-        return logits, video_vector
+        # B. Self-Attention Features (BERT의 기본 출력)
+        t_out = self.bert(**t_inputs).last_hidden_state  # (Batch, T_Seq, Hidden)
+        c_out = self.bert(**c_inputs).last_hidden_state  # (Batch, C_Seq, Hidden)
 
+        # C. Cross-Attention Features
+        # 1. 제목이 댓글을 참조 (Cross-T)
+        attn_t2c, _ = self.title_to_comment_attn(
+            query=t_out, key=c_out, value=c_out, 
+            key_padding_mask=~(c_inputs['attention_mask'].bool())
+        )
+        # 2. 댓글이 제목을 참조 (Cross-C)
+        attn_c2t, _ = self.comment_to_title_attn(
+            query=c_out, key=t_out, value=t_out, 
+            key_padding_mask=~(t_inputs['attention_mask'].bool())
+        )
+
+        # D. Pooling (각각의 시퀀스를 벡터로 변환)
+        # 1 & 2: 원래의 Self-Attention 정보 (Mean Pooling)
+        pool_t_self = t_out.mean(dim=1)
+        pool_c_self = c_out.mean(dim=1)
+        
+        # 3 & 4: 상호작용된 Cross-Attention 정보 (Mean Pooling)
+        pool_t_cross = attn_t2c.mean(dim=1)
+        pool_c_cross = attn_c2t.mean(dim=1)
+
+        # E. THE MEGA CONCATENATION (이어붙이기)
+        # [Batch, Hidden*4] 의 거대한 벡터 생성
+        mega_vector = torch.cat([
+            pool_t_self, 
+            pool_c_self, 
+            pool_t_cross, 
+            pool_c_cross
+        ], dim=-1)
+
+        # F. Classification
+        logits = self.classifier(mega_vector)
+        
+        return logits, mega_vector
 # ==========================================
 # 4. 실행 및 테스트 (Main Loop)
 # ==========================================
@@ -233,8 +255,15 @@ if __name__ == "__main__":
 
     # --- C. 모델 초기화 ---
     model = BiasAnalyzer(CONFIG)
-    optimizer = optim.AdamW(model.parameters(), lr=CONFIG['learning_rate'])
-    criterion = nn.CrossEntropyLoss()
+    # BERT 전체 동결
+    for param in model.bert.parameters():
+        param.requires_grad = False
+
+    # 옵티마이저 정의 (requires_grad=True인 파라미터만 최적화하도록 설정)
+    optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), 
+                            lr=1e-4, # 동결했을 때는 LR을 조금 높여도(1e-4) 됩니다.
+                            weight_decay=0.01)
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     best_val_accuracy = 0.0 # Best Model 저장을 위한 변수
 
     # ⭐ 시각화를 위한 history 딕셔너리 초기화 ⭐
